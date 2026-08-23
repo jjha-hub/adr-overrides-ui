@@ -20,28 +20,122 @@ PRECEDENCE_KEY = "custodian_precedence"
 DEFAULT_ORDER = ("BNY", "CITI", "JPM", "DB")
 KNOWN = list(DEFAULT_ORDER)
 
-OVERRIDEABLE_FIELDS = sorted(
-    {
-        "dr_ratio",
-        "dr_cusip",
-        "dr_isin",
-        "ord_sym",
-        "ord_isin",
-        "ord_fx",
-        "name",
-        "dr_custodian",
-        "create_closed",
-        "cancel_closed",
-    }
-)
-STATUSES = [
-    "draft",
-    "pending_approval",
-    "approved",
-    "rejected",
-    "revoked",
-    "expired",
+# Full publish contract (matches adr_platinum schema; excludes loaded_at).
+ADR_PLATINUM_COLUMNS: list[str] = [
+    "date",
+    "dr_sym",
+    "dr_cusip",
+    "dr_sedol",
+    "dr_isin",
+    "dr_fx",
+    "dr_mic",
+    "ord_sym",
+    "ord_cusip",
+    "ord_sedol",
+    "ord_isin",
+    "ord_fx",
+    "ord_mic",
+    "ord_country",
+    "name",
+    "source",
+    "effective_date",
+    "dr_ratio",
+    "dr_custodian",
+    "dr_fx_close",
+    "ord_fx_close",
+    "dr_close",
+    "ord_close",
+    "create_closed",
+    "cancel_closed",
+    "closed_special",
+    "next_open_date",
+    "next_close_date",
+    "prev_open_date",
+    "prev_close_date",
+    "dsf_fee",
+    "dr_divamt",
+    "dr_divfx",
+    "dr_divfee",
+    "dr_div_fx_close",
+    "ord_divamt",
+    "ord_divfx",
+    "ord_divfee",
+    "ord_div_fx_close",
+    "dr_splitratio",
+    "ord_splitratio",
+    "dr_sharesout",
+    "ord_sharesout",
+    "dr_shareslimit",
+    "manual_override_flag",
+    "override_doc_url",
 ]
+
+OVERRIDEABLE_FIELDS: tuple[str, ...] = tuple(
+    sorted(
+        {
+            "dr_sym",
+            "dr_cusip",
+            "dr_sedol",
+            "dr_isin",
+            "ord_sym",
+            "ord_cusip",
+            "ord_sedol",
+            "ord_isin",
+            "ord_fx",
+            "ord_mic",
+            "ord_country",
+            "name",
+            "effective_date",
+            "dr_ratio",
+            "dr_custodian",
+            "create_closed",
+            "cancel_closed",
+            "closed_special",
+            "next_open_date",
+            "next_close_date",
+            "prev_open_date",
+            "prev_close_date",
+            "dsf_fee",
+            "dr_divamt",
+            "dr_divfx",
+            "dr_divfee",
+            "dr_div_fx_close",
+            "ord_divamt",
+            "ord_divfx",
+            "ord_divfee",
+            "ord_div_fx_close",
+            "dr_splitratio",
+            "ord_splitratio",
+            "dr_sharesout",
+            "ord_sharesout",
+            "dr_shareslimit",
+        }
+    )
+)
+
+FIELD_HINTS: dict[str, str] = {
+    "dr_ratio": "Float — DR:ORD ratio",
+    "create_closed": "0 or 1",
+    "cancel_closed": "0 or 1",
+    "closed_special": "0 or 1",
+    "effective_date": "YYYY-MM-DD",
+    "next_open_date": "YYYY-MM-DD",
+    "next_close_date": "YYYY-MM-DD",
+    "prev_open_date": "YYYY-MM-DD",
+    "prev_close_date": "YYYY-MM-DD",
+    "dr_custodian": "BNY, CITI, JPM, or DB",
+}
+
+STATUSES = sorted(
+    [
+        "draft",
+        "pending_approval",
+        "approved",
+        "rejected",
+        "revoked",
+        "expired",
+    ]
+)
 
 PLATINUM_DDL = f"""
 CREATE TABLE IF NOT EXISTS {TABLE}
@@ -184,6 +278,11 @@ def escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
+def platinum_select_list() -> str:
+    """Comma-separated platinum column list for SELECT."""
+    return ", ".join(ADR_PLATINUM_COLUMNS)
+
+
 def load_precedence() -> tuple[str, ...]:
     """Load custodian precedence from config table."""
     df = query_df(
@@ -204,13 +303,29 @@ def load_precedence() -> tuple[str, ...]:
     return tuple(parts)
 
 
+def lookup_platinum_row(dr_sym: str, as_of: date) -> Optional[pd.Series]:
+    """Return one platinum row for pre-filling the override form."""
+    df = query_df(
+        f"""
+        SELECT {platinum_select_list()}
+        FROM {TABLE}
+        WHERE date = '{as_of.isoformat()}' AND dr_sym = '{escape(dr_sym)}'
+        LIMIT 1
+        """
+    )
+    if df.empty:
+        return None
+    return df.iloc[0]
+
+
 def page_review() -> None:
-    """Review platinum + override ledger."""
+    """Review platinum + override ledger with full column contract."""
+    st.subheader("Review & Search")
     c1, c2, c3 = st.columns(3)
     with c1:
-        start = st.date_input("Start date", value=date.today())
+        start = st.date_input("Start date", value=date(2026, 8, 21))
     with c2:
-        end = st.date_input("End date", value=date.today())
+        end = st.date_input("End date", value=date(2026, 8, 21))
     with c3:
         symbol = st.text_input("DR symbol", value="").strip().upper()
 
@@ -220,8 +335,7 @@ def page_review() -> None:
 
     plat = query_df(
         f"""
-        SELECT date, dr_sym, ord_sym, dr_ratio, dr_custodian, source,
-               create_closed, cancel_closed, manual_override_flag, override_doc_url
+        SELECT {platinum_select_list()}
         FROM {TABLE}
         WHERE date BETWEEN '{start.isoformat()}' AND '{end.isoformat()}'
         {sym} {flag}
@@ -229,15 +343,25 @@ def page_review() -> None:
         LIMIT 500
         """
     )
-    st.caption(f"Platinum rows: {len(plat)}")
-    st.dataframe(plat, use_container_width=True)
+    st.caption(
+        f"Platinum rows: {len(plat)} · "
+        f"columns: {len(ADR_PLATINUM_COLUMNS)} (full contract)"
+    )
+    st.dataframe(plat, use_container_width=True, height=420)
+
+    with st.expander("Column reference"):
+        st.write(
+            "Publish contract columns (same order as CSV / ClickHouse): "
+            + ", ".join(f"`{c}`" for c in ADR_PLATINUM_COLUMNS)
+        )
 
     st.markdown("### Override ledger")
     ov = query_df(
         f"""
-        SELECT override_id, dr_sym, field_name, auto_value, override_value,
+        SELECT override_id, dr_sym, dr_cusip, dr_isin, ord_sym, ord_isin,
+               field_name, auto_value, override_value,
                status, effective_start, effective_end, evidence_url,
-               created_by, approved_by, reason
+               created_by, approved_by, reason, created_at
         FROM {OVERRIDES} FINAL
         WHERE effective_start <= '{end.isoformat()}'
           AND (effective_end IS NULL OR effective_end >= '{start.isoformat()}')
@@ -250,37 +374,128 @@ def page_review() -> None:
 
 
 def page_override() -> None:
-    """Create / approve field overrides."""
+    """Create / approve field overrides with full overridable field set."""
     st.subheader("Manual Override Form")
-    dr_sym = st.text_input("DR symbol", value="").strip().upper()
-    field_name = st.selectbox("Field", OVERRIDEABLE_FIELDS)
-    override_value = st.text_input("Override value")
-    reason = st.text_area("Reason")
-    evidence_url = st.text_input("Evidence URL (Confluence)")
-    status = st.selectbox("Status", STATUSES, index=2)
-    effective_start = st.date_input("Effective start", value=date.today())
-    use_end = st.checkbox("Set effective end", value=False)
-    effective_end = st.date_input("Effective end", value=date.today()) if use_end else None
-    created_by = st.text_input("Created by", value="adam")
-    approved_by = st.text_input("Approved by", value="adam")
+    st.caption(
+        f"{len(OVERRIDEABLE_FIELDS)} overridable fields · "
+        "values publish on next `adr_platinum` run (18:00 ET or manual)."
+    )
 
-    if st.button("Save override", type="primary"):
-        if not dr_sym or not override_value or not reason:
-            st.error("dr_sym, override_value, and reason are required")
+    with st.expander("Lookup current platinum row (optional)", expanded=False):
+        lc1, lc2, lc3 = st.columns(3)
+        with lc1:
+            lookup_sym = st.text_input("DR symbol", key="lookup_sym").strip().upper()
+        with lc2:
+            lookup_date = st.date_input("As-of date", value=date(2026, 8, 21), key="lookup_date")
+        with lc3:
+            st.write("")
+            st.write("")
+            do_lookup = st.button("Load row into form")
+        if do_lookup and lookup_sym:
+            row = lookup_platinum_row(lookup_sym, lookup_date)
+            if row is None:
+                st.warning(f"No platinum row for {lookup_sym} on {lookup_date}")
+            else:
+                st.session_state["form_dr_sym"] = lookup_sym
+                st.session_state["form_dr_cusip"] = row.get("dr_cusip") or ""
+                st.session_state["form_dr_isin"] = row.get("dr_isin") or ""
+                st.session_state["form_ord_sym"] = row.get("ord_sym") or ""
+                st.session_state["form_ord_isin"] = row.get("ord_isin") or ""
+                st.session_state["form_field"] = "dr_ratio"
+                st.session_state["form_auto"] = str(row.get("dr_ratio") or "")
+                st.success(f"Loaded {lookup_sym} — pick field and set override value.")
+                st.dataframe(
+                    pd.DataFrame([row])[ADR_PLATINUM_COLUMNS],
+                    use_container_width=True,
+                )
+
+    with st.form("override_form"):
+        st.markdown("**Identifiers**")
+        id1, id2, id3 = st.columns(3)
+        with id1:
+            dr_sym = st.text_input(
+                "DR symbol *",
+                value=st.session_state.get("form_dr_sym", ""),
+            ).strip().upper()
+            dr_cusip = st.text_input(
+                "DR CUSIP",
+                value=st.session_state.get("form_dr_cusip", ""),
+            ).strip().upper() or None
+            dr_isin = st.text_input(
+                "DR ISIN",
+                value=st.session_state.get("form_dr_isin", ""),
+            ).strip().upper() or None
+        with id2:
+            ord_sym = st.text_input(
+                "ORD symbol",
+                value=st.session_state.get("form_ord_sym", ""),
+            ).strip().upper() or None
+            ord_cusip = st.text_input("ORD CUSIP").strip().upper() or None
+            ord_isin = st.text_input(
+                "ORD ISIN",
+                value=st.session_state.get("form_ord_isin", ""),
+            ).strip().upper() or None
+        with id3:
+            field_name = st.selectbox(
+                "Field to override *",
+                OVERRIDEABLE_FIELDS,
+                index=OVERRIDEABLE_FIELDS.index(
+                    st.session_state.get("form_field", "dr_ratio")
+                )
+                if st.session_state.get("form_field", "dr_ratio") in OVERRIDEABLE_FIELDS
+                else OVERRIDEABLE_FIELDS.index("dr_ratio"),
+            )
+            hint = FIELD_HINTS.get(field_name, "")
+            if hint:
+                st.caption(hint)
+
+        st.markdown("**Override**")
+        ov1, ov2 = st.columns(2)
+        with ov1:
+            auto_value = st.text_input(
+                "Auto value (pipeline today)",
+                value=st.session_state.get("form_auto", ""),
+            ) or None
+            override_value = st.text_input("Override value *")
+        with ov2:
+            reason = st.text_area("Reason *")
+            evidence_url = st.text_input("Evidence URL (Confluence)") or None
+
+        st.markdown("**Effective dates & workflow**")
+        wf1, wf2, wf3 = st.columns(3)
+        with wf1:
+            effective_start = st.date_input("Effective start *", value=date.today())
+            use_end = st.checkbox("Set effective end", value=False)
+            effective_end = (
+                st.date_input("Effective end", value=date.today(), disabled=not use_end)
+                if use_end
+                else None
+            )
+        with wf2:
+            status = st.selectbox("Status", STATUSES, index=STATUSES.index("approved"))
+            created_by = st.text_input("Created by *", value="adam")
+        with wf3:
+            approved_by = st.text_input("Approved by", value="adam") or None
+
+        submitted = st.form_submit_button("Save override", type="primary")
+
+    if submitted:
+        if not dr_sym or not override_value or not reason or not created_by:
+            st.error("DR symbol, override value, reason, and created by are required.")
             return
         now = datetime.utcnow()
         row = {
             "override_id": f"ui-{uuid.uuid4().hex[:12]}",
             "dr_sym": dr_sym,
-            "dr_cusip": None,
-            "dr_isin": None,
-            "ord_sym": None,
-            "ord_isin": None,
+            "dr_cusip": dr_cusip,
+            "dr_isin": dr_isin,
+            "ord_sym": ord_sym,
+            "ord_isin": ord_isin,
             "field_name": field_name,
-            "auto_value": None,
+            "auto_value": auto_value,
             "override_value": override_value,
             "reason": reason,
-            "evidence_url": evidence_url or None,
+            "evidence_url": evidence_url,
             "status": status,
             "effective_start": effective_start,
             "effective_end": effective_end if use_end else None,
@@ -293,21 +508,22 @@ def page_override() -> None:
         try:
             get_client().insert_df(OVERRIDES, pd.DataFrame([row]))
             st.success(
-                f"Saved `{row['override_id']}`. "
+                f"Saved `{row['override_id']}` ({field_name}={override_value}). "
                 "Re-run adr_platinum (or wait for 18:00 ET) to publish."
             )
         except Exception as exc:  # noqa: BLE001
             st.error(f"Save failed: {exc}")
 
+    st.markdown("### Pending approvals")
     pending = query_df(
         f"""
-        SELECT override_id, dr_sym, field_name, override_value, reason, created_by
+        SELECT override_id, dr_sym, field_name, auto_value, override_value,
+               reason, evidence_url, created_by, created_at
         FROM {OVERRIDES} FINAL
         WHERE status IN ('draft', 'pending_approval')
         ORDER BY created_at DESC LIMIT 100
         """
     )
-    st.markdown("### Pending")
     st.dataframe(pending, use_container_width=True)
     if not pending.empty:
         pick = st.selectbox("Approve override_id", pending["override_id"].tolist())
@@ -320,12 +536,12 @@ def page_override() -> None:
             if full.empty:
                 st.error("Not found")
             else:
-                row = full.iloc[0].to_dict()
-                row["status"] = "approved"
-                row["approved_by"] = approver
-                row["approved_at"] = datetime.utcnow()
-                row["updated_at"] = datetime.utcnow()
-                get_client().insert_df(OVERRIDES, pd.DataFrame([row]))
+                approve_row = full.iloc[0].to_dict()
+                approve_row["status"] = "approved"
+                approve_row["approved_by"] = approver
+                approve_row["approved_at"] = datetime.utcnow()
+                approve_row["updated_at"] = datetime.utcnow()
+                get_client().insert_df(OVERRIDES, pd.DataFrame([approve_row]))
                 st.success(f"Approved {pick}")
                 st.rerun()
 
@@ -367,8 +583,7 @@ def main() -> None:
     """App entrypoint."""
     st.set_page_config(page_title="ADR Manual Overrides", layout="wide")
     try:
-        client = get_client()
-        host = client.server_host if hasattr(client, "server_host") else "clickhouse"
+        get_client()
         active = load_precedence()
     except Exception as exc:  # noqa: BLE001
         st.error(f"ClickHouse unavailable: {exc}")
@@ -377,7 +592,7 @@ def main() -> None:
 
     st.title("ADR Platinum Manual Overrides")
     st.caption(
-        f"Connected for edits on Cloud platinum / overrides. "
+        f"Full platinum contract ({len(ADR_PLATINUM_COLUMNS)} columns). "
         f"Precedence: {' > '.join(active)}."
     )
     page = st.sidebar.radio(

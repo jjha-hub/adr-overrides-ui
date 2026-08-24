@@ -1,10 +1,12 @@
-"""Minimal ADR platinum overrides UI for Streamlit Community Cloud.
+"""ADR platinum overrides UI for Streamlit Community Cloud.
 
-Talks only to ClickHouse Cloud via secrets. No Lupine monorepo required.
+Talks only to ClickHouse Cloud via secrets. Supports override + precedence
+workflows (hold / approve / reject) and an append-only History screen.
 """
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import date, datetime
 from typing import Any, Optional
@@ -16,11 +18,15 @@ import streamlit as st
 TABLE = "adr.adr_platinum"
 OVERRIDES = "adr.manual_adr_overrides"
 CONFIG = "adr.adr_platinum_config"
+HISTORY = "adr.adr_ui_history"
+PREC_REQ = "adr.adr_precedence_requests"
+
 PRECEDENCE_KEY = "custodian_precedence"
+PRECEDENCE_SCOPE_KEY = "custodian_precedence_scope"
 DEFAULT_ORDER = ("BNY", "CITI", "JPM", "DB")
 KNOWN = list(DEFAULT_ORDER)
+HOLD_STATUSES = ("hold", "pending_approval", "draft")
 
-# Full publish contract (matches adr_platinum schema; excludes loaded_at).
 ADR_PLATINUM_COLUMNS: list[str] = [
     "date",
     "dr_sym",
@@ -126,17 +132,6 @@ FIELD_HINTS: dict[str, str] = {
     "dr_custodian": "BNY, CITI, JPM, or DB",
 }
 
-STATUSES = sorted(
-    [
-        "draft",
-        "pending_approval",
-        "approved",
-        "rejected",
-        "revoked",
-        "expired",
-    ]
-)
-
 PLATINUM_DDL = f"""
 CREATE TABLE IF NOT EXISTS {TABLE}
 (
@@ -231,6 +226,42 @@ ENGINE = ReplacingMergeTree(updated_at)
 ORDER BY (config_key)
 """
 
+HISTORY_DDL = f"""
+CREATE TABLE IF NOT EXISTS {HISTORY}
+(
+    event_id String,
+    event_type String,
+    entity_id String,
+    action String,
+    status String,
+    summary String,
+    detail String,
+    actor String,
+    event_at DateTime,
+    updated_at DateTime DEFAULT now()
+)
+ENGINE = MergeTree
+ORDER BY (event_at, event_id)
+"""
+
+PREC_REQ_DDL = f"""
+CREATE TABLE IF NOT EXISTS {PREC_REQ}
+(
+    request_id String,
+    precedence_order String,
+    field_scope String,
+    status String,
+    reason String,
+    created_by String,
+    created_at DateTime,
+    decided_by Nullable(String),
+    decided_at Nullable(DateTime),
+    updated_at DateTime DEFAULT now()
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (request_id)
+"""
+
 
 def _secrets_ch() -> dict[str, Any]:
     """Read ``[clickhouse]`` from Streamlit secrets."""
@@ -246,7 +277,7 @@ def _secrets_ch() -> dict[str, Any]:
 
 @st.cache_resource
 def get_client():
-    """Cached ClickHouse Cloud client."""
+    """Cached ClickHouse Cloud client; ensure UI tables exist."""
     ch = _secrets_ch()
     client = clickhouse_connect.get_client(
         host=str(ch.get("host", "so3us9c9hq.us-east-1.aws.clickhouse.cloud")),
@@ -258,9 +289,14 @@ def get_client():
         send_receive_timeout=300,
     )
     client.command("CREATE DATABASE IF NOT EXISTS adr")
-    client.command(PLATINUM_DDL)
-    client.command(OVERRIDES_DDL)
-    client.command(CONFIG_DDL)
+    for ddl in (
+        PLATINUM_DDL,
+        OVERRIDES_DDL,
+        CONFIG_DDL,
+        HISTORY_DDL,
+        PREC_REQ_DDL,
+    ):
+        client.command(ddl)
     return client
 
 
@@ -283,8 +319,47 @@ def platinum_select_list() -> str:
     return ", ".join(ADR_PLATINUM_COLUMNS)
 
 
+def now_utc() -> datetime:
+    """UTC timestamp for ledger rows."""
+    return datetime.utcnow()
+
+
+def log_history(
+    *,
+    event_type: str,
+    entity_id: str,
+    action: str,
+    status: str,
+    summary: str,
+    detail: dict[str, Any] | str,
+    actor: str,
+) -> None:
+    """Append one UI history event (approve / hold / reject / save)."""
+    detail_text = detail if isinstance(detail, str) else json.dumps(detail, default=str)
+    ts = now_utc()
+    get_client().insert_df(
+        HISTORY,
+        pd.DataFrame(
+            [
+                {
+                    "event_id": f"hist-{uuid.uuid4().hex[:12]}",
+                    "event_type": event_type,
+                    "entity_id": entity_id,
+                    "action": action,
+                    "status": status,
+                    "summary": summary,
+                    "detail": detail_text,
+                    "actor": actor or "ui",
+                    "event_at": ts,
+                    "updated_at": ts,
+                }
+            ]
+        ),
+    )
+
+
 def load_precedence() -> tuple[str, ...]:
-    """Load custodian precedence from config table."""
+    """Load active (approved) custodian precedence from config."""
     df = query_df(
         f"""
         SELECT config_value FROM {CONFIG} FINAL
@@ -303,6 +378,22 @@ def load_precedence() -> tuple[str, ...]:
     return tuple(parts)
 
 
+def load_precedence_scope() -> list[str]:
+    """Load approved field scope for precedence (``*`` = all)."""
+    df = query_df(
+        f"""
+        SELECT config_value FROM {CONFIG} FINAL
+        WHERE config_key = '{PRECEDENCE_SCOPE_KEY}' LIMIT 1
+        """
+    )
+    if df.empty:
+        return ["*"]
+    raw = str(df.iloc[0]["config_value"]).strip()
+    if raw in {"*", "ALL", ""}:
+        return ["*"]
+    return [p for p in raw.split("|") if p]
+
+
 def lookup_platinum_row(dr_sym: str, as_of: date) -> Optional[pd.Series]:
     """Return one platinum row for pre-filling the override form."""
     df = query_df(
@@ -316,6 +407,166 @@ def lookup_platinum_row(dr_sym: str, as_of: date) -> Optional[pd.Series]:
     if df.empty:
         return None
     return df.iloc[0]
+
+
+def fetch_override(override_id: str) -> Optional[dict[str, Any]]:
+    """Load one override row by id."""
+    df = query_df(
+        f"""
+        SELECT * FROM {OVERRIDES} FINAL
+        WHERE override_id = '{escape(override_id)}'
+        LIMIT 1
+        """
+    )
+    if df.empty:
+        return None
+    return df.iloc[0].to_dict()
+
+
+def save_override_row(row: dict[str, Any]) -> None:
+    """Upsert one override ledger row."""
+    get_client().insert_df(OVERRIDES, pd.DataFrame([row]))
+
+
+def set_override_status(
+    override_id: str,
+    status: str,
+    actor: str,
+) -> None:
+    """Hold / approve / reject an existing override and log history."""
+    row = fetch_override(override_id)
+    if row is None:
+        st.error(f"Override `{override_id}` not found")
+        return
+    ts = now_utc()
+    row["status"] = status
+    row["updated_at"] = ts
+    if status == "approved":
+        row["approved_by"] = actor
+        row["approved_at"] = ts
+    else:
+        row["approved_by"] = None
+        row["approved_at"] = None
+    save_override_row(row)
+    log_history(
+        event_type="override",
+        entity_id=override_id,
+        action=status,
+        status=status,
+        summary=(
+            f"{status}: {row.get('dr_sym')} "
+            f"{row.get('field_name')}={row.get('override_value')}"
+        ),
+        detail=row,
+        actor=actor,
+    )
+    st.success(f"`{override_id}` → **{status}**")
+
+
+def fetch_prec_request(request_id: str) -> Optional[dict[str, Any]]:
+    """Load one precedence request."""
+    df = query_df(
+        f"""
+        SELECT * FROM {PREC_REQ} FINAL
+        WHERE request_id = '{escape(request_id)}'
+        LIMIT 1
+        """
+    )
+    if df.empty:
+        return None
+    return df.iloc[0].to_dict()
+
+
+def save_prec_request(row: dict[str, Any]) -> None:
+    """Upsert one precedence request."""
+    get_client().insert_df(PREC_REQ, pd.DataFrame([row]))
+
+
+def apply_approved_precedence(order: str, field_scope: str, actor: str) -> None:
+    """Write approved precedence (+ field scope) into live config for ETL."""
+    ts = now_utc()
+    get_client().insert_df(
+        CONFIG,
+        pd.DataFrame(
+            [
+                {
+                    "config_key": PRECEDENCE_KEY,
+                    "config_value": order,
+                    "updated_by": actor or "ui",
+                    "updated_at": ts,
+                },
+                {
+                    "config_key": PRECEDENCE_SCOPE_KEY,
+                    "config_value": field_scope,
+                    "updated_by": actor or "ui",
+                    "updated_at": ts,
+                },
+            ]
+        ),
+    )
+
+
+def set_prec_status(request_id: str, status: str, actor: str) -> None:
+    """Hold / approve / reject a precedence request and log history."""
+    row = fetch_prec_request(request_id)
+    if row is None:
+        st.error(f"Precedence request `{request_id}` not found")
+        return
+    ts = now_utc()
+    row["status"] = status
+    row["updated_at"] = ts
+    row["decided_by"] = actor
+    row["decided_at"] = ts
+    save_prec_request(row)
+    if status == "approved":
+        apply_approved_precedence(
+            str(row["precedence_order"]),
+            str(row["field_scope"]),
+            actor,
+        )
+    log_history(
+        event_type="precedence",
+        entity_id=request_id,
+        action=status,
+        status=status,
+        summary=(
+            f"{status}: {row.get('precedence_order')} "
+            f"on fields={row.get('field_scope')}"
+        ),
+        detail=row,
+        actor=actor,
+    )
+    st.success(f"Precedence `{request_id}` → **{status}**")
+
+
+def status_action_buttons(
+    *,
+    key_prefix: str,
+    entity_label: str,
+    on_hold,
+    on_approve,
+    on_reject,
+) -> None:
+    """Render Hold / Approve / Reject buttons for a just-saved or pending item."""
+    st.markdown(f"**Decide {entity_label}**")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("Hold", key=f"{key_prefix}_hold", use_container_width=True):
+            on_hold()
+            st.rerun()
+    with c2:
+        if st.button(
+            "Approve",
+            key=f"{key_prefix}_approve",
+            type="primary",
+            use_container_width=True,
+        ):
+            on_approve()
+            st.rerun()
+    with c3:
+        if st.button("Reject", key=f"{key_prefix}_reject", use_container_width=True):
+            on_reject()
+            st.rerun()
 
 
 def page_review() -> None:
@@ -344,22 +595,14 @@ def page_review() -> None:
         """
     )
     st.caption(
-        f"Platinum rows: {len(plat)} · "
-        f"columns: {len(ADR_PLATINUM_COLUMNS)} (full contract)"
+        f"Platinum rows: {len(plat)} · columns: {len(ADR_PLATINUM_COLUMNS)}"
     )
     st.dataframe(plat, use_container_width=True, height=420)
-
-    with st.expander("Column reference"):
-        st.write(
-            "Publish contract columns (same order as CSV / ClickHouse): "
-            + ", ".join(f"`{c}`" for c in ADR_PLATINUM_COLUMNS)
-        )
 
     st.markdown("### Override ledger")
     ov = query_df(
         f"""
-        SELECT override_id, dr_sym, dr_cusip, dr_isin, ord_sym, ord_isin,
-               field_name, auto_value, override_value,
+        SELECT override_id, dr_sym, field_name, auto_value, override_value,
                status, effective_start, effective_end, evidence_url,
                created_by, approved_by, reason, created_at
         FROM {OVERRIDES} FINAL
@@ -374,11 +617,11 @@ def page_review() -> None:
 
 
 def page_override() -> None:
-    """Create / approve field overrides with full overridable field set."""
+    """Create overrides; decide with Hold / Approve / Reject."""
     st.subheader("Manual Override Form")
     st.caption(
-        f"{len(OVERRIDEABLE_FIELDS)} overridable fields · "
-        "values publish on next `adr_platinum` run (18:00 ET or manual)."
+        "Save creates an override on **hold**. Then Hold / Approve / Reject. "
+        "Only **approved** overrides are applied by the next `adr_platinum` run."
     )
 
     with st.expander("Lookup current platinum row (optional)", expanded=False):
@@ -386,7 +629,9 @@ def page_override() -> None:
         with lc1:
             lookup_sym = st.text_input("DR symbol", key="lookup_sym").strip().upper()
         with lc2:
-            lookup_date = st.date_input("As-of date", value=date(2026, 8, 21), key="lookup_date")
+            lookup_date = st.date_input(
+                "As-of date", value=date(2026, 8, 21), key="lookup_date"
+            )
         with lc3:
             st.write("")
             st.write("")
@@ -403,7 +648,7 @@ def page_override() -> None:
                 st.session_state["form_ord_isin"] = row.get("ord_isin") or ""
                 st.session_state["form_field"] = "dr_ratio"
                 st.session_state["form_auto"] = str(row.get("dr_ratio") or "")
-                st.success(f"Loaded {lookup_sym} — pick field and set override value.")
+                st.success(f"Loaded {lookup_sym}")
                 st.dataframe(
                     pd.DataFrame([row])[ADR_PLATINUM_COLUMNS],
                     use_container_width=True,
@@ -417,33 +662,46 @@ def page_override() -> None:
                 "DR symbol *",
                 value=st.session_state.get("form_dr_sym", ""),
             ).strip().upper()
-            dr_cusip = st.text_input(
-                "DR CUSIP",
-                value=st.session_state.get("form_dr_cusip", ""),
-            ).strip().upper() or None
-            dr_isin = st.text_input(
-                "DR ISIN",
-                value=st.session_state.get("form_dr_isin", ""),
-            ).strip().upper() or None
+            dr_cusip = (
+                st.text_input(
+                    "DR CUSIP",
+                    value=st.session_state.get("form_dr_cusip", ""),
+                ).strip().upper()
+                or None
+            )
+            dr_isin = (
+                st.text_input(
+                    "DR ISIN",
+                    value=st.session_state.get("form_dr_isin", ""),
+                ).strip().upper()
+                or None
+            )
         with id2:
-            ord_sym = st.text_input(
-                "ORD symbol",
-                value=st.session_state.get("form_ord_sym", ""),
-            ).strip().upper() or None
-            ord_cusip = st.text_input("ORD CUSIP").strip().upper() or None
-            ord_isin = st.text_input(
-                "ORD ISIN",
-                value=st.session_state.get("form_ord_isin", ""),
-            ).strip().upper() or None
+            ord_sym = (
+                st.text_input(
+                    "ORD symbol",
+                    value=st.session_state.get("form_ord_sym", ""),
+                ).strip().upper()
+                or None
+            )
+            ord_isin = (
+                st.text_input(
+                    "ORD ISIN",
+                    value=st.session_state.get("form_ord_isin", ""),
+                ).strip().upper()
+                or None
+            )
         with id3:
+            default_field = st.session_state.get("form_field", "dr_ratio")
+            field_idx = (
+                OVERRIDEABLE_FIELDS.index(default_field)
+                if default_field in OVERRIDEABLE_FIELDS
+                else OVERRIDEABLE_FIELDS.index("dr_ratio")
+            )
             field_name = st.selectbox(
                 "Field to override *",
                 OVERRIDEABLE_FIELDS,
-                index=OVERRIDEABLE_FIELDS.index(
-                    st.session_state.get("form_field", "dr_ratio")
-                )
-                if st.session_state.get("form_field", "dr_ratio") in OVERRIDEABLE_FIELDS
-                else OVERRIDEABLE_FIELDS.index("dr_ratio"),
+                index=field_idx,
             )
             hint = FIELD_HINTS.get(field_name, "")
             if hint:
@@ -452,131 +710,297 @@ def page_override() -> None:
         st.markdown("**Override**")
         ov1, ov2 = st.columns(2)
         with ov1:
-            auto_value = st.text_input(
-                "Auto value (pipeline today)",
-                value=st.session_state.get("form_auto", ""),
-            ) or None
+            auto_value = (
+                st.text_input(
+                    "Auto value (pipeline today)",
+                    value=st.session_state.get("form_auto", ""),
+                )
+                or None
+            )
             override_value = st.text_input("Override value *")
         with ov2:
             reason = st.text_area("Reason *")
             evidence_url = st.text_input("Evidence URL (Confluence)") or None
 
-        st.markdown("**Effective dates & workflow**")
-        wf1, wf2, wf3 = st.columns(3)
+        st.markdown("**Effective dates**")
+        wf1, wf2 = st.columns(2)
         with wf1:
             effective_start = st.date_input("Effective start *", value=date.today())
             use_end = st.checkbox("Set effective end", value=False)
             effective_end = (
-                st.date_input("Effective end", value=date.today(), disabled=not use_end)
+                st.date_input(
+                    "Effective end", value=date.today(), disabled=not use_end
+                )
                 if use_end
                 else None
             )
         with wf2:
-            status = st.selectbox("Status", STATUSES, index=STATUSES.index("approved"))
             created_by = st.text_input("Created by *", value="adam")
-        with wf3:
-            approved_by = st.text_input("Approved by", value="adam") or None
 
-        submitted = st.form_submit_button("Save override", type="primary")
+        submitted = st.form_submit_button("Save override (starts on Hold)", type="primary")
 
     if submitted:
         if not dr_sym or not override_value or not reason or not created_by:
             st.error("DR symbol, override value, reason, and created by are required.")
-            return
-        now = datetime.utcnow()
-        row = {
-            "override_id": f"ui-{uuid.uuid4().hex[:12]}",
-            "dr_sym": dr_sym,
-            "dr_cusip": dr_cusip,
-            "dr_isin": dr_isin,
-            "ord_sym": ord_sym,
-            "ord_isin": ord_isin,
-            "field_name": field_name,
-            "auto_value": auto_value,
-            "override_value": override_value,
-            "reason": reason,
-            "evidence_url": evidence_url,
-            "status": status,
-            "effective_start": effective_start,
-            "effective_end": effective_end if use_end else None,
-            "created_by": created_by,
-            "created_at": now,
-            "approved_by": approved_by if status == "approved" else None,
-            "approved_at": now if status == "approved" else None,
-            "updated_at": now,
-        }
-        try:
-            get_client().insert_df(OVERRIDES, pd.DataFrame([row]))
-            st.success(
-                f"Saved `{row['override_id']}` ({field_name}={override_value}). "
-                "Re-run adr_platinum (or wait for 18:00 ET) to publish."
-            )
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"Save failed: {exc}")
+        else:
+            ts = now_utc()
+            oid = f"ui-{uuid.uuid4().hex[:12]}"
+            row = {
+                "override_id": oid,
+                "dr_sym": dr_sym,
+                "dr_cusip": dr_cusip,
+                "dr_isin": dr_isin,
+                "ord_sym": ord_sym,
+                "ord_isin": ord_isin,
+                "field_name": field_name,
+                "auto_value": auto_value,
+                "override_value": override_value,
+                "reason": reason,
+                "evidence_url": evidence_url,
+                "status": "hold",
+                "effective_start": effective_start,
+                "effective_end": effective_end if use_end else None,
+                "created_by": created_by,
+                "created_at": ts,
+                "approved_by": None,
+                "approved_at": None,
+                "updated_at": ts,
+            }
+            try:
+                save_override_row(row)
+                log_history(
+                    event_type="override",
+                    entity_id=oid,
+                    action="save",
+                    status="hold",
+                    summary=f"saved on hold: {dr_sym} {field_name}={override_value}",
+                    detail=row,
+                    actor=created_by,
+                )
+                st.session_state["last_override_id"] = oid
+                st.session_state["last_override_actor"] = created_by
+                st.success(
+                    f"Saved `{oid}` on **hold**. Choose Hold / Approve / Reject below."
+                )
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Save failed: {exc}")
 
-    st.markdown("### Pending approvals")
+    last_oid = st.session_state.get("last_override_id")
+    if last_oid:
+        actor = st.session_state.get("last_override_actor", "adam")
+        st.info(f"Last saved override: `{last_oid}`")
+        status_action_buttons(
+            key_prefix=f"ov_{last_oid}",
+            entity_label=f"override `{last_oid}`",
+            on_hold=lambda: set_override_status(last_oid, "hold", actor),
+            on_approve=lambda: set_override_status(last_oid, "approved", actor),
+            on_reject=lambda: set_override_status(last_oid, "rejected", actor),
+        )
+
+    st.markdown("### Pending approvals (on hold)")
     pending = query_df(
         f"""
         SELECT override_id, dr_sym, field_name, auto_value, override_value,
-               reason, evidence_url, created_by, created_at
+               reason, evidence_url, created_by, created_at, status
         FROM {OVERRIDES} FINAL
-        WHERE status IN ('draft', 'pending_approval')
-        ORDER BY created_at DESC LIMIT 100
+        WHERE status IN ('hold', 'pending_approval', 'draft')
+        ORDER BY created_at DESC
+        LIMIT 100
         """
     )
     st.dataframe(pending, use_container_width=True)
     if not pending.empty:
-        pick = st.selectbox("Approve override_id", pending["override_id"].tolist())
-        approver = st.text_input("Approver", value="adam", key="approver2")
-        if st.button("Approve selected"):
-            full = query_df(
-                f"SELECT * FROM {OVERRIDES} FINAL "
-                f"WHERE override_id = '{escape(pick)}' LIMIT 1"
-            )
-            if full.empty:
-                st.error("Not found")
-            else:
-                approve_row = full.iloc[0].to_dict()
-                approve_row["status"] = "approved"
-                approve_row["approved_by"] = approver
-                approve_row["approved_at"] = datetime.utcnow()
-                approve_row["updated_at"] = datetime.utcnow()
-                get_client().insert_df(OVERRIDES, pd.DataFrame([approve_row]))
-                st.success(f"Approved {pick}")
-                st.rerun()
+        pick = st.selectbox(
+            "Select override_id",
+            pending["override_id"].tolist(),
+            key="pending_override_pick",
+        )
+        actor2 = st.text_input("Actor", value="adam", key="pending_override_actor")
+        status_action_buttons(
+            key_prefix=f"pend_ov_{pick}",
+            entity_label=f"override `{pick}`",
+            on_hold=lambda: set_override_status(pick, "hold", actor2),
+            on_approve=lambda: set_override_status(pick, "approved", actor2),
+            on_reject=lambda: set_override_status(pick, "rejected", actor2),
+        )
 
 
 def page_precedence() -> None:
-    """Edit custodian precedence for the pipeline."""
+    """Propose custodian precedence for selected fields; hold/approve/reject."""
     st.subheader("Custodian Precedence")
     current = load_precedence()
-    st.info(f"Active: {' > '.join(current)}")
+    scope = load_precedence_scope()
+    st.info(
+        f"Active approved order: **{' > '.join(current)}** · "
+        f"field scope: `{', '.join(scope)}`"
+    )
+    st.caption(
+        "Saving creates a precedence **request on hold**. Approve to publish into "
+        "`adr.adr_platinum_config` for the next ETL. Field scope is stored for "
+        "UI/audit; pipeline currently applies the approved bank order globally "
+        "to custodian-precedence fields until field-scoped ETL lands."
+    )
+
+    select_all = st.checkbox("Select all overridable fields", value=False)
+    if select_all:
+        selected_fields = list(OVERRIDEABLE_FIELDS)
+        st.multiselect(
+            "Fields this precedence applies to",
+            list(OVERRIDEABLE_FIELDS),
+            default=selected_fields,
+            disabled=True,
+            key="prec_fields_locked",
+        )
+    else:
+        selected_fields = st.multiselect(
+            "Fields this precedence applies to (checkbox multi-select)",
+            list(OVERRIDEABLE_FIELDS),
+            default=[],
+            key="prec_fields",
+        )
+
+    if selected_fields:
+        st.markdown("**Selected fields**")
+        st.write(", ".join(f"`{f}`" for f in selected_fields))
+    else:
+        st.warning("Select at least one field, or use Select all.")
+
     cols = st.columns(4)
     picks: list[str] = []
     for i, label in enumerate(("1st", "2nd", "3rd", "4th")):
         with cols[i]:
             idx = KNOWN.index(current[i]) if current[i] in KNOWN else i
             picks.append(st.selectbox(label, KNOWN, index=idx, key=f"p{i}"))
-    updated_by = st.text_input("Saved by", value="adam")
-    if st.button("Save precedence", type="primary"):
-        if len(set(picks)) != 4:
+
+    reason = st.text_area("Reason for precedence change", value="")
+    created_by = st.text_input("Requested by", value="adam", key="prec_actor")
+
+    if st.button("Save precedence request (starts on Hold)", type="primary"):
+        if not selected_fields and not select_all:
+            st.error("Choose fields (or Select all)")
+        elif len(set(picks)) != 4:
             st.error("Each custodian must appear once")
-            return
-        get_client().insert_df(
-            CONFIG,
-            pd.DataFrame(
-                [
-                    {
-                        "config_key": PRECEDENCE_KEY,
-                        "config_value": "|".join(picks),
-                        "updated_by": updated_by or "ui",
-                        "updated_at": datetime.utcnow(),
-                    }
-                ]
-            ),
+        else:
+            fields = list(OVERRIDEABLE_FIELDS) if select_all else selected_fields
+            scope_val = "*" if select_all or set(fields) == set(OVERRIDEABLE_FIELDS) else "|".join(fields)
+            order = "|".join(picks)
+            rid = f"prec-{uuid.uuid4().hex[:12]}"
+            ts = now_utc()
+            row = {
+                "request_id": rid,
+                "precedence_order": order,
+                "field_scope": scope_val,
+                "status": "hold",
+                "reason": reason or "precedence change",
+                "created_by": created_by or "ui",
+                "created_at": ts,
+                "decided_by": None,
+                "decided_at": None,
+                "updated_at": ts,
+            }
+            save_prec_request(row)
+            log_history(
+                event_type="precedence",
+                entity_id=rid,
+                action="save",
+                status="hold",
+                summary=f"saved on hold: {order} scope={scope_val}",
+                detail=row,
+                actor=created_by or "ui",
+            )
+            st.session_state["last_prec_id"] = rid
+            st.session_state["last_prec_actor"] = created_by or "ui"
+            st.success(f"Saved precedence request `{rid}` on **hold**.")
+
+    last_prec = st.session_state.get("last_prec_id")
+    if last_prec:
+        actor = st.session_state.get("last_prec_actor", "adam")
+        st.info(f"Last saved precedence request: `{last_prec}`")
+        status_action_buttons(
+            key_prefix=f"prec_{last_prec}",
+            entity_label=f"precedence `{last_prec}`",
+            on_hold=lambda: set_prec_status(last_prec, "hold", actor),
+            on_approve=lambda: set_prec_status(last_prec, "approved", actor),
+            on_reject=lambda: set_prec_status(last_prec, "rejected", actor),
         )
-        st.success(f"Saved {' > '.join(picks)}. Re-run adr_platinum to apply.")
-        st.rerun()
+
+    st.markdown("### Pending approvals (on hold)")
+    pending = query_df(
+        f"""
+        SELECT request_id, precedence_order, field_scope, status, reason,
+               created_by, created_at
+        FROM {PREC_REQ} FINAL
+        WHERE status IN ('hold', 'pending_approval', 'draft')
+        ORDER BY created_at DESC
+        LIMIT 100
+        """
+    )
+    st.dataframe(pending, use_container_width=True)
+    if not pending.empty:
+        pick = st.selectbox(
+            "Select request_id",
+            pending["request_id"].tolist(),
+            key="pending_prec_pick",
+        )
+        actor2 = st.text_input("Actor", value="adam", key="pending_prec_actor")
+        # Show fields for selected request
+        req = fetch_prec_request(pick)
+        if req:
+            st.caption(
+                f"Order: `{req.get('precedence_order')}` · "
+                f"Fields: `{req.get('field_scope')}`"
+            )
+        status_action_buttons(
+            key_prefix=f"pend_prec_{pick}",
+            entity_label=f"precedence `{pick}`",
+            on_hold=lambda: set_prec_status(pick, "hold", actor2),
+            on_approve=lambda: set_prec_status(pick, "approved", actor2),
+            on_reject=lambda: set_prec_status(pick, "rejected", actor2),
+        )
+
+
+def page_history() -> None:
+    """Append-only history of override + precedence decisions."""
+    st.subheader("History")
+    st.caption(
+        "Every save / hold / approve / reject for overrides and custodian "
+        "precedence is logged here with date/time."
+    )
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        event_type = st.selectbox(
+            "Type",
+            ["All", "override", "precedence"],
+            index=0,
+        )
+    with c2:
+        status = st.selectbox(
+            "Status / action",
+            ["All", "hold", "approved", "rejected", "save"],
+            index=0,
+        )
+    with c3:
+        limit = st.number_input("Limit", min_value=50, max_value=2000, value=200)
+
+    clauses = []
+    if event_type != "All":
+        clauses.append(f"event_type = '{event_type}'")
+    if status != "All":
+        clauses.append(f"(action = '{status}' OR status = '{status}')")
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    hist = query_df(
+        f"""
+        SELECT event_at, event_type, entity_id, action, status,
+               summary, actor, detail
+        FROM {HISTORY}
+        {where}
+        ORDER BY event_at DESC
+        LIMIT {int(limit)}
+        """
+    )
+    st.caption(f"Events: {len(hist)}")
+    st.dataframe(hist, use_container_width=True, height=480)
 
 
 def main() -> None:
@@ -585,6 +1009,7 @@ def main() -> None:
     try:
         get_client()
         active = load_precedence()
+        scope = load_precedence_scope()
     except Exception as exc:  # noqa: BLE001
         st.error(f"ClickHouse unavailable: {exc}")
         st.stop()
@@ -592,19 +1017,26 @@ def main() -> None:
 
     st.title("ADR Platinum Manual Overrides")
     st.caption(
-        f"Full platinum contract ({len(ADR_PLATINUM_COLUMNS)} columns). "
-        f"Precedence: {' > '.join(active)}."
+        f"Connected to ClickHouse Cloud. Active precedence: "
+        f"{' > '.join(active)} (scope: {', '.join(scope)})."
     )
     page = st.sidebar.radio(
         "Screen",
-        ["Review & Search", "Manual Override Form", "Custodian Precedence"],
+        [
+            "Review & Search",
+            "Manual Override Form",
+            "Custodian Precedence",
+            "History",
+        ],
     )
     if page == "Review & Search":
         page_review()
     elif page == "Manual Override Form":
         page_override()
-    else:
+    elif page == "Custodian Precedence":
         page_precedence()
+    else:
+        page_history()
 
 
 if __name__ == "__main__":

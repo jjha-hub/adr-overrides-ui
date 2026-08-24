@@ -539,34 +539,39 @@ def set_prec_status(request_id: str, status: str, actor: str) -> None:
     st.success(f"Precedence `{request_id}` → **{status}**")
 
 
-def status_action_buttons(
+def status_decision_dropdown(
     *,
     key_prefix: str,
     entity_label: str,
     on_hold,
     on_approve,
     on_reject,
+    actions: tuple[str, ...] = ("Hold", "Approve", "Reject"),
 ) -> None:
-    """Render Hold / Approve / Reject buttons for a just-saved or pending item."""
+    """Render a status dropdown + Apply for hold / approve / reject."""
     st.markdown(f"**Decide {entity_label}**")
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns([3, 1])
     with c1:
-        if st.button("Hold", key=f"{key_prefix}_hold", use_container_width=True):
-            on_hold()
-            st.rerun()
+        choice = st.selectbox(
+            "Action",
+            list(actions),
+            key=f"{key_prefix}_action",
+            label_visibility="collapsed",
+        )
     with c2:
-        if st.button(
-            "Approve",
-            key=f"{key_prefix}_approve",
-            type="primary",
-            use_container_width=True,
-        ):
+        apply = st.button("Apply", key=f"{key_prefix}_apply", type="primary")
+    if apply:
+        selected = str(choice).strip().lower()
+        if selected == "hold":
+            on_hold()
+        elif selected == "approve":
             on_approve()
-            st.rerun()
-    with c3:
-        if st.button("Reject", key=f"{key_prefix}_reject", use_container_width=True):
+        elif selected == "reject":
             on_reject()
-            st.rerun()
+        else:
+            st.error(f"Unknown action: {choice}")
+            return
+        st.rerun()
 
 
 def page_review() -> None:
@@ -789,7 +794,7 @@ def page_override() -> None:
     if last_oid:
         actor = st.session_state.get("last_override_actor") or "ui"
         st.info(f"Last saved override: `{last_oid}`")
-        status_action_buttons(
+        status_decision_dropdown(
             key_prefix=f"ov_{last_oid}",
             entity_label=f"override `{last_oid}`",
             on_hold=lambda: set_override_status(last_oid, "hold", actor),
@@ -816,7 +821,7 @@ def page_override() -> None:
             key="pending_override_pick",
         )
         actor2 = st.text_input("Actor", value="", key="pending_override_actor")
-        status_action_buttons(
+        status_decision_dropdown(
             key_prefix=f"pend_ov_{pick}",
             entity_label=f"override `{pick}`",
             on_hold=lambda: set_override_status(pick, "hold", actor2 or "ui"),
@@ -824,60 +829,50 @@ def page_override() -> None:
             on_reject=lambda: set_override_status(pick, "rejected", actor2 or "ui"),
         )
 
-    st.markdown("### Re-open any override (including rejected / approved)")
+    st.markdown("### Re-open approved overrides (to undo)")
     st.caption(
-        "Rejected items leave Pending. Pick any override_id here to Hold / "
-        "Approve / Reject again later."
+        "Only **approved** overrides appear here. Reject one so the next "
+        "`adr_platinum` run stops applying it (undo). Hold moves it back to Pending."
     )
-    all_ov = query_df(
+    approved_ov = query_df(
         f"""
         SELECT override_id, dr_sym, field_name, override_value, status,
                created_by, updated_at
         FROM {OVERRIDES} FINAL
+        WHERE status = 'approved'
         ORDER BY updated_at DESC
         LIMIT 200
         """
     )
-    st.dataframe(all_ov, use_container_width=True)
-    if not all_ov.empty:
-        filter_status = st.selectbox(
-            "Filter by status",
-            ["All", "hold", "approved", "rejected", "draft", "pending_approval"],
-            key="reopen_ov_status_filter",
+    st.dataframe(approved_ov, use_container_width=True)
+    if not approved_ov.empty:
+        pick_any = st.selectbox(
+            "Select approved override_id",
+            approved_ov["override_id"].tolist(),
+            key="reopen_override_pick",
         )
-        choices = all_ov
-        if filter_status != "All":
-            choices = all_ov.loc[all_ov["status"].astype(str) == filter_status]
-        ids = choices["override_id"].tolist() if not choices.empty else []
-        if ids:
-            pick_any = st.selectbox(
-                "Select override_id to re-decide",
-                ids,
-                key="reopen_override_pick",
+        actor3 = st.text_input("Actor", value="", key="reopen_override_actor")
+        cur = fetch_override(pick_any)
+        if cur:
+            st.caption(
+                f"Current status: **{cur.get('status')}** · "
+                f"{cur.get('dr_sym')} · {cur.get('field_name')}="
+                f"{cur.get('override_value')}"
             )
-            actor3 = st.text_input("Actor", value="", key="reopen_override_actor")
-            cur = fetch_override(pick_any)
-            if cur:
-                st.caption(
-                    f"Current status: **{cur.get('status')}** · "
-                    f"{cur.get('dr_sym')} · {cur.get('field_name')}="
-                    f"{cur.get('override_value')}"
-                )
-            status_action_buttons(
-                key_prefix=f"reopen_ov_{pick_any}",
-                entity_label=f"override `{pick_any}`",
-                on_hold=lambda: set_override_status(
-                    pick_any, "hold", actor3 or "ui"
-                ),
-                on_approve=lambda: set_override_status(
-                    pick_any, "approved", actor3 or "ui"
-                ),
-                on_reject=lambda: set_override_status(
-                    pick_any, "rejected", actor3 or "ui"
-                ),
-            )
-        else:
-            st.info(f"No overrides with status `{filter_status}`.")
+        status_decision_dropdown(
+            key_prefix=f"reopen_ov_{pick_any}",
+            entity_label=f"override `{pick_any}`",
+            on_hold=lambda: set_override_status(pick_any, "hold", actor3 or "ui"),
+            on_approve=lambda: set_override_status(
+                pick_any, "approved", actor3 or "ui"
+            ),
+            on_reject=lambda: set_override_status(
+                pick_any, "rejected", actor3 or "ui"
+            ),
+            actions=("Reject", "Hold", "Approve"),
+        )
+    else:
+        st.info("No approved overrides to re-open.")
 
 
 def page_precedence() -> None:
@@ -914,11 +909,10 @@ def page_precedence() -> None:
             key="prec_fields",
         )
 
-    if selected_fields:
+    if selected_fields or select_all:
+        shown = list(OVERRIDEABLE_FIELDS) if select_all else selected_fields
         st.markdown("**Selected fields**")
-        st.write(", ".join(f"`{f}`" for f in selected_fields))
-    else:
-        st.warning("Select at least one field, or use Select all.")
+        st.write(", ".join(f"`{f}`" for f in shown))
 
     cols = st.columns(4)
     picks: list[str] = []
@@ -930,14 +924,18 @@ def page_precedence() -> None:
     reason = st.text_area("Reason for precedence change", value="")
     created_by = st.text_input("Requested by", value="", key="prec_actor")
 
-    if st.button("Save precedence request (starts on Hold)", type="primary"):
+    if st.button("Save", type="primary"):
         if not selected_fields and not select_all:
-            st.error("Choose fields (or Select all)")
+            st.error("Select at least one field, or use Select all.")
         elif len(set(picks)) != 4:
             st.error("Each custodian must appear once")
         else:
             fields = list(OVERRIDEABLE_FIELDS) if select_all else selected_fields
-            scope_val = "*" if select_all or set(fields) == set(OVERRIDEABLE_FIELDS) else "|".join(fields)
+            scope_val = (
+                "*"
+                if select_all or set(fields) == set(OVERRIDEABLE_FIELDS)
+                else "|".join(fields)
+            )
             order = "|".join(picks)
             rid = f"prec-{uuid.uuid4().hex[:12]}"
             ts = now_utc()
@@ -971,7 +969,7 @@ def page_precedence() -> None:
     if last_prec:
         actor = st.session_state.get("last_prec_actor") or "ui"
         st.info(f"Last saved precedence request: `{last_prec}`")
-        status_action_buttons(
+        status_decision_dropdown(
             key_prefix=f"prec_{last_prec}",
             entity_label=f"precedence `{last_prec}`",
             on_hold=lambda: set_prec_status(last_prec, "hold", actor),
@@ -1005,60 +1003,13 @@ def page_precedence() -> None:
                 f"Order: `{req.get('precedence_order')}` · "
                 f"Fields: `{req.get('field_scope')}`"
             )
-        status_action_buttons(
+        status_decision_dropdown(
             key_prefix=f"pend_prec_{pick}",
             entity_label=f"precedence `{pick}`",
             on_hold=lambda: set_prec_status(pick, "hold", actor2 or "ui"),
             on_approve=lambda: set_prec_status(pick, "approved", actor2 or "ui"),
             on_reject=lambda: set_prec_status(pick, "rejected", actor2 or "ui"),
         )
-
-    st.markdown("### Re-open any precedence request (including rejected)")
-    all_prec = query_df(
-        f"""
-        SELECT request_id, precedence_order, field_scope, status,
-               created_by, updated_at
-        FROM {PREC_REQ} FINAL
-        ORDER BY updated_at DESC
-        LIMIT 200
-        """
-    )
-    st.dataframe(all_prec, use_container_width=True)
-    if not all_prec.empty:
-        filter_p = st.selectbox(
-            "Filter by status",
-            ["All", "hold", "approved", "rejected", "draft", "pending_approval"],
-            key="reopen_prec_status_filter",
-        )
-        choices_p = all_prec
-        if filter_p != "All":
-            choices_p = all_prec.loc[all_prec["status"].astype(str) == filter_p]
-        pids = choices_p["request_id"].tolist() if not choices_p.empty else []
-        if pids:
-            pick_p = st.selectbox(
-                "Select request_id to re-decide",
-                pids,
-                key="reopen_prec_pick",
-            )
-            actor_p = st.text_input("Actor", value="", key="reopen_prec_actor")
-            req = fetch_prec_request(pick_p)
-            if req:
-                st.caption(
-                    f"Current: **{req.get('status')}** · "
-                    f"`{req.get('precedence_order')}` · "
-                    f"fields=`{req.get('field_scope')}`"
-                )
-            status_action_buttons(
-                key_prefix=f"reopen_prec_{pick_p}",
-                entity_label=f"precedence `{pick_p}`",
-                on_hold=lambda: set_prec_status(pick_p, "hold", actor_p or "ui"),
-                on_approve=lambda: set_prec_status(
-                    pick_p, "approved", actor_p or "ui"
-                ),
-                on_reject=lambda: set_prec_status(
-                    pick_p, "rejected", actor_p or "ui"
-                ),
-            )
 
 
 def page_history() -> None:

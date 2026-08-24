@@ -735,7 +735,7 @@ def page_override() -> None:
                 else None
             )
         with wf2:
-            created_by = st.text_input("Created by *", value="adam")
+            created_by = st.text_input("Created by *", value="")
 
         submitted = st.form_submit_button("Save override (starts on Hold)", type="primary")
 
@@ -787,7 +787,7 @@ def page_override() -> None:
 
     last_oid = st.session_state.get("last_override_id")
     if last_oid:
-        actor = st.session_state.get("last_override_actor", "adam")
+        actor = st.session_state.get("last_override_actor") or "ui"
         st.info(f"Last saved override: `{last_oid}`")
         status_action_buttons(
             key_prefix=f"ov_{last_oid}",
@@ -815,7 +815,7 @@ def page_override() -> None:
             pending["override_id"].tolist(),
             key="pending_override_pick",
         )
-        actor2 = st.text_input("Actor", value="adam", key="pending_override_actor")
+        actor2 = st.text_input("Actor", value="", key="pending_override_actor")
         status_action_buttons(
             key_prefix=f"pend_ov_{pick}",
             entity_label=f"override `{pick}`",
@@ -873,7 +873,7 @@ def page_precedence() -> None:
             picks.append(st.selectbox(label, KNOWN, index=idx, key=f"p{i}"))
 
     reason = st.text_area("Reason for precedence change", value="")
-    created_by = st.text_input("Requested by", value="adam", key="prec_actor")
+    created_by = st.text_input("Requested by", value="", key="prec_actor")
 
     if st.button("Save precedence request (starts on Hold)", type="primary"):
         if not selected_fields and not select_all:
@@ -914,7 +914,7 @@ def page_precedence() -> None:
 
     last_prec = st.session_state.get("last_prec_id")
     if last_prec:
-        actor = st.session_state.get("last_prec_actor", "adam")
+        actor = st.session_state.get("last_prec_actor") or "ui"
         st.info(f"Last saved precedence request: `{last_prec}`")
         status_action_buttons(
             key_prefix=f"prec_{last_prec}",
@@ -942,7 +942,7 @@ def page_precedence() -> None:
             pending["request_id"].tolist(),
             key="pending_prec_pick",
         )
-        actor2 = st.text_input("Actor", value="adam", key="pending_prec_actor")
+        actor2 = st.text_input("Actor", value="", key="pending_prec_actor")
         # Show fields for selected request
         req = fetch_prec_request(pick)
         if req:

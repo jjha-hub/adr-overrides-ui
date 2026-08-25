@@ -20,12 +20,16 @@ OVERRIDES = "adr.manual_adr_overrides"
 CONFIG = "adr.adr_platinum_config"
 HISTORY = "adr.adr_ui_history"
 PREC_REQ = "adr.adr_precedence_requests"
+SECMASTER = "us_equities.security_master_daily"
 
 PRECEDENCE_KEY = "custodian_precedence"
 PRECEDENCE_SCOPE_KEY = "custodian_precedence_scope"
 DEFAULT_ORDER = ("BNY", "CITI", "JPM", "DB")
 KNOWN = list(DEFAULT_ORDER)
 HOLD_STATUSES = ("hold", "pending_approval", "draft")
+LIQUID_VOL_THRESHOLD = 1000
+LIQUID_LOOKBACK_DAYS = 30
+SANDBOX_KEY = "sandbox_on"
 
 ADR_PLATINUM_COLUMNS: list[str] = [
     "date",
@@ -311,6 +315,23 @@ def escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
+def sandbox_enabled() -> bool:
+    """Return whether Feature Sandbox hidden screens are unlocked."""
+    return bool(st.session_state.get(SANDBOX_KEY, False))
+
+
+def liquid_ticker_sql(as_of: date, *, threshold: int = LIQUID_VOL_THRESHOLD) -> str:
+    """SQL subquery of tickers with 30d sum(VOLUME) >= threshold as of ``as_of``."""
+    return f"""
+        SELECT TICKER
+        FROM {SECMASTER}
+        WHERE toDate(Time) > toDate('{as_of.isoformat()}') - {LIQUID_LOOKBACK_DAYS}
+          AND toDate(Time) <= toDate('{as_of.isoformat()}')
+        GROUP BY TICKER
+        HAVING sum(VOLUME) >= {int(threshold)}
+    """
+
+
 def platinum_select_list() -> str:
     """Comma-separated platinum column list for SELECT."""
     return ", ".join(ADR_PLATINUM_COLUMNS)
@@ -582,23 +603,68 @@ def page_review() -> None:
     with c3:
         symbol = st.text_input("DR symbol", value="").strip().upper()
 
-    only_ov = st.checkbox("Manual override only", value=False)
+    f1, f2 = st.columns(2)
+    with f1:
+        only_ov = st.checkbox("Manual override only", value=False)
+    with f2:
+        liquid_only = st.checkbox(
+            f"Liquid only ({LIQUID_LOOKBACK_DAYS}d volume ≥ "
+            f"{LIQUID_VOL_THRESHOLD:,})",
+            value=False,
+            help=(
+                "Keep ADR rows whose US secmaster ticker has sum(VOLUME) ≥ "
+                f"{LIQUID_VOL_THRESHOLD:,} over the {LIQUID_LOOKBACK_DAYS} days "
+                "ending on End date. Illiquid / unmatched symbols are hidden."
+            ),
+        )
+
     sym = f"AND dr_sym = '{escape(symbol)}'" if symbol else ""
     flag = "AND manual_override_flag = 1" if only_ov else ""
+    liquid = ""
+    if liquid_only:
+        liquid = (
+            f"AND dr_sym IN ({liquid_ticker_sql(end, threshold=LIQUID_VOL_THRESHOLD)})"
+        )
+
+    count_row = query_df(
+        f"""
+        SELECT
+            count() AS total_rows,
+            countIf(
+                dr_sym IN ({liquid_ticker_sql(end, threshold=LIQUID_VOL_THRESHOLD)})
+            ) AS liquid_rows
+        FROM {TABLE}
+        WHERE date BETWEEN '{start.isoformat()}' AND '{end.isoformat()}'
+        {sym} {flag}
+        """
+    )
+    total_rows = int(count_row.iloc[0]["total_rows"]) if not count_row.empty else 0
+    liquid_rows = int(count_row.iloc[0]["liquid_rows"]) if not count_row.empty else 0
 
     plat = query_df(
         f"""
         SELECT {platinum_select_list()}
         FROM {TABLE}
         WHERE date BETWEEN '{start.isoformat()}' AND '{end.isoformat()}'
-        {sym} {flag}
+        {sym} {flag} {liquid}
         ORDER BY date DESC, dr_sym
         LIMIT 500
         """
     )
-    st.caption(
-        f"Platinum rows: {len(plat)} · columns: {len(ADR_PLATINUM_COLUMNS)}"
-    )
+    if liquid_only:
+        st.caption(
+            f"Platinum rows shown: {len(plat)} (limit 500) · "
+            f"liquid matching filter: {liquid_rows} / {total_rows} · "
+            f"columns: {len(ADR_PLATINUM_COLUMNS)} · "
+            f"volume window ends {end.isoformat()}"
+        )
+    else:
+        st.caption(
+            f"Platinum rows shown: {len(plat)} (limit 500) · "
+            f"matching filter: {total_rows} · "
+            f"liquid (30d vol ≥ {LIQUID_VOL_THRESHOLD:,}): {liquid_rows} · "
+            f"columns: {len(ADR_PLATINUM_COLUMNS)}"
+        )
     st.dataframe(plat, use_container_width=True, height=420)
 
     st.markdown("### Override ledger")
@@ -616,6 +682,34 @@ def page_review() -> None:
         """
     )
     st.dataframe(ov, use_container_width=True)
+
+
+def page_sandbox() -> None:
+    """Toggle experimental screens (Custodian Precedence, etc.)."""
+    st.subheader("Feature Sandbox")
+    st.caption(
+        "Unlock experimental / admin screens. Off by default so production "
+        "users only see Review, Overrides, and History."
+    )
+    enabled = st.toggle(
+        "Show hidden features",
+        value=sandbox_enabled(),
+        key="sandbox_toggle",
+    )
+    st.session_state[SANDBOX_KEY] = bool(enabled)
+
+    if enabled:
+        st.success("Sandbox ON — hidden screens appear in the sidebar.")
+        st.markdown(
+            """
+**Currently unlocked**
+- **Custodian Precedence** — change bank priority / field scope workflow
+            """
+        )
+    else:
+        st.info(
+            "Sandbox OFF — Custodian Precedence is hidden from the sidebar."
+        )
 
 
 def page_override() -> None:
@@ -1056,6 +1150,8 @@ def page_history() -> None:
 def main() -> None:
     """App entrypoint."""
     st.set_page_config(page_title="ADR Manual Overrides", layout="wide")
+    if SANDBOX_KEY not in st.session_state:
+        st.session_state[SANDBOX_KEY] = False
     try:
         get_client()
         active = load_precedence()
@@ -1070,21 +1166,36 @@ def main() -> None:
         f"Connected to ClickHouse Cloud. Active precedence: "
         f"{' > '.join(active)} (scope: {', '.join(scope)})."
     )
-    page = st.sidebar.radio(
-        "Screen",
-        [
+
+    pages = [
+        "Review & Search",
+        "Manual Override Form",
+        "History",
+        "Feature Sandbox",
+    ]
+    if sandbox_enabled():
+        # Insert before History so production order stays stable when off.
+        pages = [
             "Review & Search",
             "Manual Override Form",
             "Custodian Precedence",
             "History",
-        ],
-    )
+            "Feature Sandbox",
+        ]
+
+    page = st.sidebar.radio("Screen", pages, key="nav_screen")
     if page == "Review & Search":
         page_review()
     elif page == "Manual Override Form":
         page_override()
     elif page == "Custodian Precedence":
-        page_precedence()
+        if not sandbox_enabled():
+            st.warning("Turn on Feature Sandbox to use Custodian Precedence.")
+            page_sandbox()
+        else:
+            page_precedence()
+    elif page == "Feature Sandbox":
+        page_sandbox()
     else:
         page_history()
 

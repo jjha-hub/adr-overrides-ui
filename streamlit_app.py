@@ -78,6 +78,7 @@ ADR_PLATINUM_COLUMNS: list[str] = [
     "dr_shareslimit",
     "manual_override_flag",
     "override_doc_url",
+    "is_valid",
 ]
 
 OVERRIDEABLE_FIELDS: tuple[str, ...] = tuple(
@@ -183,10 +184,11 @@ CREATE TABLE IF NOT EXISTS {TABLE}
     dr_shareslimit Nullable(Float64),
     manual_override_flag Int8,
     override_doc_url Nullable(String),
+    is_valid Int8 DEFAULT 1,
     loaded_at DateTime DEFAULT now()
 )
 ENGINE = MergeTree
-ORDER BY (date, dr_sym)
+ORDER BY (date, dr_sym, is_valid, loaded_at)
 """
 
 OVERRIDES_DDL = f"""
@@ -299,6 +301,14 @@ def get_client():
         PREC_REQ_DDL,
     ):
         client.command(ddl)
+    try:
+        client.command(
+            f"ALTER TABLE {TABLE} "
+            "ADD COLUMN IF NOT EXISTS is_valid Int8 DEFAULT 1 "
+            "AFTER override_doc_url"
+        )
+    except Exception:  # noqa: BLE001 — soft migrate
+        pass
     return client
 
 
@@ -414,12 +424,14 @@ def load_precedence_scope() -> list[str]:
 
 
 def lookup_platinum_row(dr_sym: str, as_of: date) -> Optional[pd.Series]:
-    """Return one platinum row for pre-filling the override form."""
+    """Return one current platinum row for pre-filling the override form."""
     df = query_df(
         f"""
         SELECT {platinum_select_list()}
         FROM {TABLE}
-        WHERE date = '{as_of.isoformat()}' AND dr_sym = '{escape(dr_sym)}'
+        WHERE date = '{as_of.isoformat()}'
+          AND dr_sym = '{escape(dr_sym)}'
+          AND is_valid = 1
         LIMIT 1
         """
     )
@@ -601,7 +613,7 @@ def page_review() -> None:
     with c3:
         symbol = st.text_input("DR symbol", value="").strip().upper()
 
-    f1, f2 = st.columns(2)
+    f1, f2, f3 = st.columns(3)
     with f1:
         only_ov = st.checkbox("Manual override only", value=False)
     with f2:
@@ -615,9 +627,20 @@ def page_review() -> None:
                 "ending on End date. Illiquid / unmatched symbols are hidden."
             ),
         )
+    with f3:
+        show_history = st.checkbox(
+            "Show override history (is_valid=0)",
+            value=False,
+            help=(
+                "Default shows only current rows (is_valid=1). Enable to also "
+                "see prior versions kept when an override was applied. "
+                "Why it changed is on the Override ledger (reason)."
+            ),
+        )
 
     sym = f"AND dr_sym = '{escape(symbol)}'" if symbol else ""
     flag = "AND manual_override_flag = 1" if only_ov else ""
+    valid = "" if show_history else "AND is_valid = 1"
     liquid = ""
     if liquid_only:
         liquid = (
@@ -633,7 +656,7 @@ def page_review() -> None:
             ) AS liquid_rows
         FROM {TABLE}
         WHERE date BETWEEN '{start.isoformat()}' AND '{end.isoformat()}'
-        {sym} {flag}
+        {sym} {flag} {valid}
         """
     )
     total_rows = int(count_row.iloc[0]["total_rows"]) if not count_row.empty else 0
@@ -644,8 +667,8 @@ def page_review() -> None:
         SELECT {platinum_select_list()}
         FROM {TABLE}
         WHERE date BETWEEN '{start.isoformat()}' AND '{end.isoformat()}'
-        {sym} {flag} {liquid}
-        ORDER BY date DESC, dr_sym
+        {sym} {flag} {valid} {liquid}
+        ORDER BY date DESC, dr_sym, is_valid DESC, loaded_at DESC
         LIMIT 500
         """
     )
@@ -715,7 +738,9 @@ def page_override() -> None:
     st.subheader("Manual Override Form")
     st.caption(
         "Save creates an override as **pending approval**. Then Approve or Reject. "
-        "Only **approved** overrides are applied by the next `adr_platinum` run."
+        "Only **approved** overrides are applied by the next `adr_platinum` run. "
+        "When applied, platinum keeps the prior row as ``is_valid=0`` and writes "
+        "the new current row as ``is_valid=1``. **Reason** stays on this ledger."
     )
 
     with st.expander("Lookup current platinum row (optional)", expanded=False):

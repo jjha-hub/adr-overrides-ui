@@ -1,7 +1,7 @@
 """ADR platinum overrides UI for Streamlit Community Cloud.
 
 Talks only to ClickHouse Cloud via secrets. Supports override + precedence
-workflows (hold / approve / reject) and an append-only History screen.
+workflows (pending → approve / reject) and an append-only History screen.
 """
 
 from __future__ import annotations
@@ -26,7 +26,8 @@ PRECEDENCE_KEY = "custodian_precedence"
 PRECEDENCE_SCOPE_KEY = "custodian_precedence_scope"
 DEFAULT_ORDER = ("BNY", "CITI", "JPM", "DB")
 KNOWN = list(DEFAULT_ORDER)
-HOLD_STATUSES = ("hold", "pending_approval", "draft")
+# New saves use pending_approval; legacy hold/draft rows still appear in Pending.
+PENDING_STATUSES = ("pending_approval", "hold", "draft")
 LIQUID_VOL_THRESHOLD = 1000
 LIQUID_LOOKBACK_DAYS = 30
 SANDBOX_KEY = "sandbox_on"
@@ -352,7 +353,7 @@ def log_history(
     detail: dict[str, Any] | str,
     actor: str,
 ) -> None:
-    """Append one UI history event (approve / hold / reject / save)."""
+    """Append one UI history event (approve / reject / save)."""
     detail_text = detail if isinstance(detail, str) else json.dumps(detail, default=str)
     ts = now_utc()
     get_client().insert_df(
@@ -451,7 +452,7 @@ def set_override_status(
     status: str,
     actor: str,
 ) -> None:
-    """Hold / approve / reject an existing override and log history."""
+    """Approve or reject an existing override and log history."""
     row = fetch_override(override_id)
     if row is None:
         st.error(f"Override `{override_id}` not found")
@@ -525,7 +526,7 @@ def apply_approved_precedence(order: str, field_scope: str, actor: str) -> None:
 
 
 def set_prec_status(request_id: str, status: str, actor: str) -> None:
-    """Hold / approve / reject a precedence request and log history."""
+    """Approve or reject a precedence request and log history."""
     row = fetch_prec_request(request_id)
     if row is None:
         st.error(f"Precedence request `{request_id}` not found")
@@ -561,12 +562,11 @@ def status_decision_dropdown(
     *,
     key_prefix: str,
     entity_label: str,
-    on_hold,
     on_approve,
     on_reject,
-    actions: tuple[str, ...] = ("Hold", "Approve", "Reject"),
+    actions: tuple[str, ...] = ("Approve", "Reject"),
 ) -> None:
-    """Render a status dropdown + Apply for hold / approve / reject."""
+    """Render a status dropdown + Apply for approve / reject."""
     st.markdown(f"**Decide {entity_label}**")
     c1, c2 = st.columns([3, 1])
     with c1:
@@ -580,9 +580,7 @@ def status_decision_dropdown(
         apply = st.button("Apply", key=f"{key_prefix}_apply", type="primary")
     if apply:
         selected = str(choice).strip().lower()
-        if selected == "hold":
-            on_hold()
-        elif selected == "approve":
+        if selected == "approve":
             on_approve()
         elif selected == "reject":
             on_reject()
@@ -716,7 +714,7 @@ def page_override() -> None:
     """Create overrides; decide with Hold / Approve / Reject."""
     st.subheader("Manual Override Form")
     st.caption(
-        "Save creates an override on **hold**. Then Hold / Approve / Reject. "
+        "Save creates an override as **pending approval**. Then Approve or Reject. "
         "Only **approved** overrides are applied by the next `adr_platinum` run."
     )
 
@@ -833,7 +831,9 @@ def page_override() -> None:
         with wf2:
             created_by = st.text_input("Created by *", value="")
 
-        submitted = st.form_submit_button("Save override (starts on Hold)", type="primary")
+        submitted = st.form_submit_button(
+            "Save override (pending approval)", type="primary"
+        )
 
     if submitted:
         if not dr_sym or not override_value or not reason or not created_by:
@@ -853,7 +853,7 @@ def page_override() -> None:
                 "override_value": override_value,
                 "reason": reason,
                 "evidence_url": evidence_url,
-                "status": "hold",
+                "status": "pending_approval",
                 "effective_start": effective_start,
                 "effective_end": effective_end if use_end else None,
                 "created_by": created_by,
@@ -868,15 +868,18 @@ def page_override() -> None:
                     event_type="override",
                     entity_id=oid,
                     action="save",
-                    status="hold",
-                    summary=f"saved on hold: {dr_sym} {field_name}={override_value}",
+                    status="pending_approval",
+                    summary=(
+                        f"saved pending: {dr_sym} {field_name}={override_value}"
+                    ),
                     detail=row,
                     actor=created_by,
                 )
                 st.session_state["last_override_id"] = oid
                 st.session_state["last_override_actor"] = created_by
                 st.success(
-                    f"Saved `{oid}` on **hold**. Choose Hold / Approve / Reject below."
+                    f"Saved `{oid}` as **pending approval**. "
+                    "Choose Approve or Reject below."
                 )
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Save failed: {exc}")
@@ -888,18 +891,18 @@ def page_override() -> None:
         status_decision_dropdown(
             key_prefix=f"ov_{last_oid}",
             entity_label=f"override `{last_oid}`",
-            on_hold=lambda: set_override_status(last_oid, "hold", actor),
             on_approve=lambda: set_override_status(last_oid, "approved", actor),
             on_reject=lambda: set_override_status(last_oid, "rejected", actor),
         )
 
-    st.markdown("### Pending approvals (on hold)")
+    pending_in = ", ".join(f"'{s}'" for s in PENDING_STATUSES)
+    st.markdown("### Pending approvals")
     pending = query_df(
         f"""
         SELECT override_id, dr_sym, field_name, auto_value, override_value,
                reason, evidence_url, created_by, created_at, status
         FROM {OVERRIDES} FINAL
-        WHERE status IN ('hold', 'pending_approval', 'draft')
+        WHERE status IN ({pending_in})
         ORDER BY created_at DESC
         LIMIT 100
         """
@@ -915,7 +918,6 @@ def page_override() -> None:
         status_decision_dropdown(
             key_prefix=f"pend_ov_{pick}",
             entity_label=f"override `{pick}`",
-            on_hold=lambda: set_override_status(pick, "hold", actor2 or "ui"),
             on_approve=lambda: set_override_status(pick, "approved", actor2 or "ui"),
             on_reject=lambda: set_override_status(pick, "rejected", actor2 or "ui"),
         )
@@ -923,7 +925,7 @@ def page_override() -> None:
     st.markdown("### Re-open approved overrides (to undo)")
     st.caption(
         "Only **approved** overrides appear here. Reject one so the next "
-        "`adr_platinum` run stops applying it (undo). Hold moves it back to Pending."
+        "`adr_platinum` run stops applying it (undo)."
     )
     approved_ov = query_df(
         f"""
@@ -953,21 +955,20 @@ def page_override() -> None:
         status_decision_dropdown(
             key_prefix=f"reopen_ov_{pick_any}",
             entity_label=f"override `{pick_any}`",
-            on_hold=lambda: set_override_status(pick_any, "hold", actor3 or "ui"),
             on_approve=lambda: set_override_status(
                 pick_any, "approved", actor3 or "ui"
             ),
             on_reject=lambda: set_override_status(
                 pick_any, "rejected", actor3 or "ui"
             ),
-            actions=("Reject", "Hold", "Approve"),
+            actions=("Reject", "Approve"),
         )
     else:
         st.info("No approved overrides to re-open.")
 
 
 def page_precedence() -> None:
-    """Propose custodian precedence for selected fields; hold/approve/reject."""
+    """Propose custodian precedence for selected fields; approve/reject."""
     st.subheader("Custodian Precedence")
     current = load_precedence()
     scope = load_precedence_scope()
@@ -976,10 +977,10 @@ def page_precedence() -> None:
         f"field scope: `{', '.join(scope)}`"
     )
     st.caption(
-        "Saving creates a precedence **request on hold**. Approve to publish into "
-        "`adr.adr_platinum_config` for the next ETL. Field scope is stored for "
-        "UI/audit; pipeline currently applies the approved bank order globally "
-        "to custodian-precedence fields until field-scoped ETL lands."
+        "Saving creates a precedence request as **pending approval**. Approve to "
+        "publish into `adr.adr_platinum_config` for the next ETL. Field scope is "
+        "stored for UI/audit; pipeline currently applies the approved bank order "
+        "globally to custodian-precedence fields until field-scoped ETL lands."
     )
 
     select_all = st.checkbox("Select all overridable fields", value=False)
@@ -1034,7 +1035,7 @@ def page_precedence() -> None:
                 "request_id": rid,
                 "precedence_order": order,
                 "field_scope": scope_val,
-                "status": "hold",
+                "status": "pending_approval",
                 "reason": reason or "precedence change",
                 "created_by": created_by or "ui",
                 "created_at": ts,
@@ -1047,14 +1048,16 @@ def page_precedence() -> None:
                 event_type="precedence",
                 entity_id=rid,
                 action="save",
-                status="hold",
-                summary=f"saved on hold: {order} scope={scope_val}",
+                status="pending_approval",
+                summary=f"saved pending: {order} scope={scope_val}",
                 detail=row,
                 actor=created_by or "ui",
             )
             st.session_state["last_prec_id"] = rid
             st.session_state["last_prec_actor"] = created_by or "ui"
-            st.success(f"Saved precedence request `{rid}` on **hold**.")
+            st.success(
+                f"Saved precedence request `{rid}` as **pending approval**."
+            )
 
     last_prec = st.session_state.get("last_prec_id")
     if last_prec:
@@ -1063,18 +1066,18 @@ def page_precedence() -> None:
         status_decision_dropdown(
             key_prefix=f"prec_{last_prec}",
             entity_label=f"precedence `{last_prec}`",
-            on_hold=lambda: set_prec_status(last_prec, "hold", actor),
             on_approve=lambda: set_prec_status(last_prec, "approved", actor),
             on_reject=lambda: set_prec_status(last_prec, "rejected", actor),
         )
 
-    st.markdown("### Pending approvals (on hold)")
+    pending_in = ", ".join(f"'{s}'" for s in PENDING_STATUSES)
+    st.markdown("### Pending approvals")
     pending = query_df(
         f"""
         SELECT request_id, precedence_order, field_scope, status, reason,
                created_by, created_at
         FROM {PREC_REQ} FINAL
-        WHERE status IN ('hold', 'pending_approval', 'draft')
+        WHERE status IN ({pending_in})
         ORDER BY created_at DESC
         LIMIT 100
         """
@@ -1097,7 +1100,6 @@ def page_precedence() -> None:
         status_decision_dropdown(
             key_prefix=f"pend_prec_{pick}",
             entity_label=f"precedence `{pick}`",
-            on_hold=lambda: set_prec_status(pick, "hold", actor2 or "ui"),
             on_approve=lambda: set_prec_status(pick, "approved", actor2 or "ui"),
             on_reject=lambda: set_prec_status(pick, "rejected", actor2 or "ui"),
         )
@@ -1107,7 +1109,7 @@ def page_history() -> None:
     """Append-only history of override + precedence decisions."""
     st.subheader("History")
     st.caption(
-        "Every save / hold / approve / reject for overrides and custodian "
+        "Every save / approve / reject for overrides and custodian "
         "precedence is logged here with date/time."
     )
     c1, c2, c3 = st.columns(3)
@@ -1120,7 +1122,7 @@ def page_history() -> None:
     with c2:
         status = st.selectbox(
             "Status / action",
-            ["All", "hold", "approved", "rejected", "save"],
+            ["All", "pending_approval", "approved", "rejected", "save", "hold"],
             index=0,
         )
     with c3:
